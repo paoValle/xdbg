@@ -488,13 +488,23 @@ func (s *session) adoptLocked(conn net.Conn) {
 	if len(s.pending) == 0 {
 		r, _, _ := s.rawLocked("run", "")
 		if r != nil && r.Status == "stopping" {
+			// The script has run: a drop on this best-effort last command is not a
+			// failed handshake, so it must not fail the adopt below.
 			s.rawLocked("stop", "") //nolint:errcheck // best-effort stop
+			s.adoptErr = nil
 		}
 		s.dropLocked()
 	}
 	if s.conn != nil {
 		s.conn.SetDeadline(time.Time{})
 		s.startReader(s.conn, s.r)
+	} else if s.adoptErr != nil {
+		// A read or write error in a handshake command drops the connection
+		// (rawLocked -> dropLocked) and records why in adoptErr. Waking the
+		// waiters without it would report a dead connection as a live session:
+		// state is already "no session" and no reader was started.
+		s.failHandshakeLocked("handshake command", s.adoptErr)
+		return
 	}
 
 	s.signalReadyLocked()
@@ -503,8 +513,9 @@ func (s *session) adoptLocked(conn net.Conn) {
 // negotiateAsyncBreakLocked asks the engine whether it can interrupt a running
 // script (DBGp feature supports_async). When the engine answers "0", pause
 // cannot work and cmd("break") is rejected early instead of blocking. Any
-// failure (old engine, no property, read error) leaves the optimistic default
-// in place. Caller holds mu; only runs during adopt, before the reader starts.
+// failure (old engine, no property) leaves the optimistic default in place; a
+// read error drops the connection, which adoptLocked reports as a failed
+// handshake. Caller holds mu; only runs during adopt, before the reader starts.
 func (s *session) negotiateAsyncBreakLocked() {
 	r, _, err := s.rawLocked("feature_get", "-n supports_async")
 	if err != nil || r == nil || len(r.Props) == 0 {
@@ -600,6 +611,7 @@ func (s *session) rawLocked(name, args string) (*xResp, string, error) {
 	_, werr := s.conn.Write([]byte(line + "\x00"))
 	s.wmu.Unlock()
 	if werr != nil {
+		s.adoptErr = werr // why the handshake fails: adoptLocked reports a dropped connection
 		s.dropLocked()
 		return nil, "", werr
 	}
@@ -613,7 +625,8 @@ func (s *session) rawLocked(name, args string) (*xResp, string, error) {
 		var err error
 		xmlStr, err = s.readPacket()
 		if err != nil {
-			s.dropLocked() // keep the #36 behaviour: drop the connection on a read error
+			s.adoptErr = err // why the handshake fails: adoptLocked reports a dropped connection
+			s.dropLocked()   // keep the #36 behaviour: drop the connection on a read error
 			return nil, "", err
 		}
 		r = xResp{}

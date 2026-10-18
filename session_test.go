@@ -1272,6 +1272,74 @@ func TestAdoptTruncatedInitPacket(t *testing.T) {
 	}
 }
 
+// TestAdoptHandshakeCommandReadError drives #110: the engine answers <init> and
+// then closes before answering a feature command. The connection is gone, so the
+// handshake must fail instead of waking the waiters as if the session were live.
+func TestAdoptHandshakeCommandReadError(t *testing.T) {
+	eng, conn := newPipe(t)
+	s := newSession("/l", "/d")
+	ready := s.ready
+	go func() {
+		eng.send(xmlProlog + `<init fileuri="file:///d/index.php"/>`)
+		_, _ = eng.readCmd() // the first feature_set, never answered
+		_ = eng.conn.Close()
+	}()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+
+	s.adopt(conn)
+
+	select {
+	case <-ready:
+	default:
+		t.Fatal("a failed handshake must wake the waiters")
+	}
+	if err := s.handshakeError(); err == nil || !strings.Contains(err.Error(), "handshake failed") {
+		t.Fatalf("handshakeError = %v, want a handshake error", err)
+	}
+	if s.state != "no session" || s.conn != nil {
+		t.Fatalf("state = %q, conn nil = %v", s.state, s.conn == nil)
+	}
+	if got := s.Status(); !strings.Contains(got, "state=no session") {
+		t.Fatalf("Status() = %q, want state=no session", got)
+	}
+}
+
+// TestAdoptStopDropAfterRunStillSucceeds pins the breakpoint-less success path:
+// when `run` answers "stopping" the script has run, so a drop on the best-effort
+// `stop` must not turn the adopt into a failed handshake.
+func TestAdoptStopDropAfterRunStillSucceeds(t *testing.T) {
+	eng, conn := newPipe(t)
+	s := newSession("/l", "/d")
+	ready := s.ready
+	go func() {
+		eng.send(xmlProlog + `<init fileuri="file:///d/index.php"/>`)
+		eng.respond(
+			`<response command="feature_set" success="1"/>`,
+			`<response command="feature_set" success="1"/>`,
+			`<response command="feature_set" success="1"/>`,
+			featureAsyncResponse,
+			`<response command="run" status="stopping"/>`,
+		)
+		_, _ = eng.readCmd() // the stop, answered by closing instead
+		_ = eng.conn.Close()
+	}()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+
+	s.adopt(conn)
+
+	select {
+	case <-ready:
+	default:
+		t.Fatal("adopt must wake the waiters")
+	}
+	if err := s.handshakeError(); err != nil {
+		t.Fatalf("handshakeError = %v, want nil: the script ran, the stop drop is best-effort", err)
+	}
+	if s.state != "no session" {
+		t.Fatalf("state = %q, want no session", s.state)
+	}
+}
+
 func TestListenWaitFailedHandshake(t *testing.T) {
 	probe, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
